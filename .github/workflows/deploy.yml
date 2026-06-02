@@ -1,0 +1,94 @@
+name: Build and deploy to Cloudflare Pages
+
+# Bypasses Cloudflare's dashboard build pipeline. GitHub Actions builds
+# locally and uses wrangler to push the `out/` folder to Cloudflare Pages.
+#
+# Triggers:
+#  - Push to main (any code change)
+#  - Cron after major European lottery draw windows (UTC)
+#  - Daily indexing nudge at 06:23 UTC
+#  - Manual via workflow_dispatch
+#
+# Required GitHub secrets:
+#  - CLOUDFLARE_API_TOKEN  (Pages — Edit)
+#  - CLOUDFLARE_ACCOUNT_ID
+#  - GOOGLE_SERVICE_ACCOUNT_JSON (optional, only for notify-google job)
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # European lottery draw windows (all UTC; covers BST / CEST / GMT / CET):
+    # EuroMillions: Tue/Fri 20:45 CEST → 19:45 UTC during DST
+    # UK Lotto / Set For Life / Thunderball: 20:00 UK = 19:00 UTC during BST
+    # Eurojackpot: Tue/Fri 21:00 CEST = 19:00 UTC during DST
+    # Just rebuild every hour during the 19:00-22:00 UTC window — cheap on
+    # public repos (unlimited Actions minutes).
+    - cron: '0 19-22 * * *'
+    - cron: '23 6 * * *'  # Daily indexing nudge
+  workflow_dispatch:
+
+# Avoid concurrent runs racing the same deploy
+concurrency:
+  group: cloudflare-deploy
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build static export
+        run: npm run build
+
+      - name: Ensure Pages project exists
+        continue-on-error: true
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages project create euromillionsresults --production-branch=main
+
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy --project-name=euromillionsresults --branch=main --commit-dirty=true
+
+  notify-google:
+    if: github.event.schedule == '23 6 * * *' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    needs: build-and-deploy
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build (produce out/sitemap.xml)
+        run: npm run build
+
+      - name: Submit URLs to Google Indexing API
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: node scripts/notify-google.mjs
